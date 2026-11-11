@@ -3238,7 +3238,7 @@ fn setBookmark(params: ?std.json.Value, out: []u8) ToolResult {
     const addr = getParamAddr(params, "address", &addr_buf) orelse
         return errResult(out, "Error: address is required.");
     var cmd_buf: [128]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&cmd_buf, "bookmarkadd {s}\x00", .{addr}) catch
+    const cmd = std.fmt.bufPrint(&cmd_buf, "bookmarkset {s}\x00", .{addr}) catch
         return errResult(out, "Error: input too long.");
     const ok = bridge.cmdExec(@ptrCast(cmd.ptr));
     return fmtResult(out, "{s}", .{if (ok) "Bookmark set." else "Error: Failed to set bookmark."});
