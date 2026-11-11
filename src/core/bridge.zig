@@ -8,7 +8,9 @@
 
 const std = @import("std");
 const win = std.os.windows;
-const BOOL = win.BOOL;
+// x64dbg bridge exports return a plain 4-byte int for BOOL. Declaring it as
+// c_int keeps ABI compatibility and avoids std's Bool enum (Zig 0.16+).
+const BOOL = c_int;
 const HMODULE = win.HMODULE;
 
 extern "kernel32" fn GetModuleHandleA(lpModuleName: ?[*:0]const u8) callconv(.winapi) ?HMODULE;

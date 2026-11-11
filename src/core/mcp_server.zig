@@ -7,8 +7,27 @@ const json_mod = @import("../mcp/json.zig");
 const JsonWriter = json_mod.JsonWriter;
 
 const ws2 = std.os.windows.ws2_32;
-const SOCKET = ws2.SOCKET;
-const INVALID_SOCKET = ws2.INVALID_SOCKET;
+
+// Winsock bindings — Zig 0.17 std no longer exports the ws2_32 functions,
+// so declare them directly. WINAPI (stdcall) calling convention matters
+// for the x86 build.
+const SOCKET = usize;
+const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
+
+extern "ws2_32" fn WSAStartup(wVersionRequired: u16, lpWSAData: [*]u8) callconv(.winapi) c_int;
+extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
+extern "ws2_32" fn socket(af: c_int, sock_type: c_int, protocol: c_int) callconv(.winapi) SOCKET;
+extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn bind(s: SOCKET, addr: *const ws2.sockaddr.in, namelen: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn listen(s: SOCKET, backlog: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn accept(s: SOCKET, addr: ?*anyopaque, addrlen: ?*c_int) callconv(.winapi) SOCKET;
+extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+
+fn htons(v: u16) u16 {
+    return @byteSwap(v); // Windows is always little-endian
+}
 
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "x64dbg-MCP Server";
@@ -27,15 +46,47 @@ extern "kernel32" fn CreateThread(
 ) callconv(.winapi) HANDLE;
 extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
 extern "kernel32" fn WaitForSingleObject(hHandle: ?*anyopaque, dwMilliseconds: u32) callconv(.winapi) u32;
+extern "kernel32" fn CreateEventA(lpEventAttributes: ?*anyopaque, bManualReset: i32, bInitialState: i32, lpName: ?[*:0]const u8) callconv(.winapi) HANDLE;
+extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) i32;
+
+// Win32 critical section wrapper. std.Thread.Mutex is unavailable because
+// this plugin is built with -fsingle-threaded (Zig strips sync primitives).
+const CRITICAL_SECTION = extern struct { opaque_data: [40]u8 align(8) };
+extern "kernel32" fn InitializeCriticalSection(lpCriticalSection: *CRITICAL_SECTION) callconv(.winapi) void;
+extern "kernel32" fn DeleteCriticalSection(lpCriticalSection: *CRITICAL_SECTION) callconv(.winapi) void;
+extern "kernel32" fn EnterCriticalSection(lpCriticalSection: *CRITICAL_SECTION) callconv(.winapi) void;
+extern "kernel32" fn LeaveCriticalSection(lpCriticalSection: *CRITICAL_SECTION) callconv(.winapi) void;
+
+const CritLock = struct {
+    cs: CRITICAL_SECTION = undefined,
+
+    fn init(self: *CritLock) void {
+        InitializeCriticalSection(&self.cs);
+    }
+    fn lock(self: *CritLock) void {
+        EnterCriticalSection(&self.cs);
+    }
+    fn unlock(self: *CritLock) void {
+        LeaveCriticalSection(&self.cs);
+    }
+    fn deinit(self: *CritLock) void {
+        DeleteCriticalSection(&self.cs);
+    }
+};
 
 var server_handle: HANDLE = null;
 pub var server_running: bool = false;
 var listen_sock: SOCKET = INVALID_SOCKET;
 
 pub var server_port: u16 = 9094;
-var server_ip: [64]u8 = .{ '1', '2', '7', '.', '0', '.', '0', '.', '1' } ++ .{0} ** 55;
+fn defaultServerIp() [64]u8 {
+    var ip: [64]u8 = @splat(0);
+    @memcpy(ip[0..9], "127.0.0.1");
+    return ip;
+}
+var server_ip: [64]u8 = defaultServerIp();
 var server_ip_len: usize = 9;
-var auth_token: [64]u8 = .{0} ** 64;
+var auth_token: [64]u8 = @splat(0);
 var auth_token_len: usize = 0;
 
 pub fn setConfig(ip: []const u8, port: u16, token: []const u8) void {
@@ -81,19 +132,188 @@ fn parseIpAddr(ip: []const u8) u32 {
     return @bitCast(octets);
 }
 
+// ── Request execution queue (single worker thread) ────────────────
+// x64dbg's engine/expression-parser and GUI APIs are NOT thread-safe.
+// Concurrent tool calls from multiple HTTP connections corrupt the
+// debugger heap (observed: simultaneous ParseExpression/GuiGetDisassembly
+// crashes). Every JSON-RPC request is therefore executed sequentially
+// on one dedicated worker thread; connection threads only do socket I/O.
+
+const JOB_BODY_CAP = 65536; // max request body size
+const JOB_RESP_CAP = 160 * 1024; // max JSON-RPC response size
+const JOB_QUEUE_CAP = 32;
+
+const RpcJob = struct {
+    body_len: usize = 0,
+    body: [JOB_BODY_CAP]u8 = undefined,
+    resp_len: usize = 0,
+    resp: [JOB_RESP_CAP]u8 = undefined,
+    done: HANDLE = null, // manual-reset event, signaled by the worker
+};
+
+var job_queue: [JOB_QUEUE_CAP]*RpcJob = undefined;
+var job_head: usize = 0;
+var job_count: usize = 0;
+var job_lock: CritLock = .{};
+var job_event: HANDLE = null; // auto-reset, signaled when a job is queued or on shutdown
+var worker_handle: HANDLE = null;
+var worker_running: bool = false;
+
+fn workerThreadProc(_: ?*anyopaque) callconv(.winapi) u32 {
+    workerLoop();
+    return 0;
+}
+
+fn workerLoop() void {
+    while (true) {
+        _ = WaitForSingleObject(job_event, 0xFFFFFFFF); // INFINITE
+        // Drain every queued job
+        while (true) {
+            job_lock.lock();
+            if (job_count == 0) {
+                const shutting_down = !worker_running;
+                job_lock.unlock();
+                if (shutting_down) return;
+                break;
+            }
+            const job = job_queue[job_head];
+            job_head = (job_head + 1) % JOB_QUEUE_CAP;
+            job_count -= 1;
+            job_lock.unlock();
+
+            const resp = processRpcRequest(job.body[0..job.body_len], &job.resp);
+            job.resp_len = resp.len;
+            _ = SetEvent(job.done);
+        }
+    }
+}
+
+/// Enqueue a raw JSON-RPC body and block until the worker has processed it.
+/// Returns the completed job (caller must destroyJob it), or null if the
+/// server is shutting down / the queue is full / the body is too large.
+fn submitRpc(body: []const u8) ?*RpcJob {
+    if (body.len > JOB_BODY_CAP) return null;
+
+    job_lock.lock();
+    if (!worker_running or job_count >= JOB_QUEUE_CAP) {
+        job_lock.unlock();
+        return null;
+    }
+    const job = std.heap.page_allocator.create(RpcJob) catch {
+        job_lock.unlock();
+        return null;
+    };
+    job.* = .{};
+    @memcpy(job.body[0..body.len], body);
+    job.body_len = body.len;
+    job.done = CreateEventA(null, 1, 0, null);
+    if (job.done == null) {
+        std.heap.page_allocator.destroy(job);
+        job_lock.unlock();
+        return null;
+    }
+    job_queue[(job_head + job_count) % JOB_QUEUE_CAP] = job;
+    job_count += 1;
+    job_lock.unlock();
+    _ = SetEvent(job_event);
+
+    _ = WaitForSingleObject(job.done, 0xFFFFFFFF); // INFINITE
+    return job;
+}
+
+fn destroyJob(job: *RpcJob) void {
+    if (job.done) |h| {
+        _ = CloseHandle(h);
+    }
+    std.heap.page_allocator.destroy(job);
+}
+
+/// Runs on the worker thread. Parses and executes one JSON-RPC request and
+/// returns the complete JSON-RPC response document, or an empty slice for
+/// notifications (which must be answered with HTTP 202 / no body).
+fn processRpcRequest(body: []const u8, resp_buf: *[JOB_RESP_CAP]u8) []const u8 {
+    var w = JsonWriter.init(resp_buf);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch {
+        writeJsonRpcErrorBody(&w, null, -32700, "Parse error");
+        return w.slice();
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const method_val = json_mod.getStringField(root, "method") orelse {
+        writeJsonRpcErrorBody(&w, null, -32600, "Invalid request: missing method");
+        return w.slice();
+    };
+    const id = json_mod.getObjectField(root, "id");
+
+    // Notifications never get a JSON-RPC response
+    if (id == null or std.mem.startsWith(u8, method_val, "notifications/")) {
+        return resp_buf[0..0];
+    }
+
+    w.raw("{\"jsonrpc\":\"2.0\",\"id\":");
+    writeJsonValue(&w, id);
+
+    if (std.mem.eql(u8, method_val, "initialize")) {
+        w.raw(",\"result\":");
+        buildInitializeResult(&w);
+    } else if (std.mem.eql(u8, method_val, "tools/list")) {
+        w.raw(",\"result\":");
+        buildToolsListResult(&w);
+    } else if (std.mem.eql(u8, method_val, "tools/call")) {
+        var tmp_buf: [131072]u8 = undefined;
+        var tw = JsonWriter.init(&tmp_buf);
+        buildToolsCallResult(&tw, root);
+        const tr = tw.slice();
+        if (std.mem.startsWith(u8, tr, "{\"error\":")) {
+            w.raw(",\"error\":{\"code\":");
+            w.writeInt(-32602);
+            w.raw(",\"message\":");
+            w.writeString(tr);
+            w.raw("}");
+        } else {
+            w.raw(",\"result\":");
+            w.raw(tr);
+        }
+    } else if (std.mem.eql(u8, method_val, "ping")) {
+        w.raw(",\"result\":{}");
+    } else {
+        w.raw(",\"error\":{\"code\":-32601,\"message\":\"Method not found\"}");
+    }
+
+    w.raw("}");
+    return w.slice();
+}
+
+fn writeJsonRpcErrorBody(w: *JsonWriter, id: ?std.json.Value, code: i32, message: []const u8) void {
+    w.raw("{\"jsonrpc\":\"2.0\",\"id\":");
+    writeJsonValue(w, id);
+    w.raw(",\"error\":{\"code\":");
+    w.writeInt(code);
+    w.raw(",\"message\":");
+    w.writeString(message);
+    w.raw("}}");
+}
+
 // ── Pending events queue (for HTTP clients that can't receive SSE) ──
 const MAX_PENDING_EVENTS = 16;
 const MAX_EVENT_LEN = 128;
 var pending_events: [MAX_PENDING_EVENTS][MAX_EVENT_LEN]u8 = undefined;
-var pending_event_lens: [MAX_PENDING_EVENTS]usize = .{0} ** MAX_PENDING_EVENTS;
+var pending_event_lens: [MAX_PENDING_EVENTS]usize = @splat(0);
 var pending_head: usize = 0;
 var pending_count: usize = 0;
+var pending_mutex: CritLock = .{};
 
 pub fn pendingHasEvents() bool {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
     return pending_count > 0;
 }
 
 pub fn pendingDrainToBuffer(out: []u8) usize {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
     var pos: usize = 0;
     while (pending_count > 0) {
         const slot = pending_head;
@@ -113,6 +333,8 @@ pub fn pendingDrainToBuffer(out: []u8) usize {
 }
 
 fn pendingPush(msg: []const u8) void {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
     const slot = (pending_head + pending_count) % MAX_PENDING_EVENTS;
     const copy_len = @min(msg.len, MAX_EVENT_LEN);
     @memcpy(pending_events[slot][0..copy_len], msg[0..copy_len]);
@@ -125,6 +347,8 @@ fn pendingPush(msg: []const u8) void {
 }
 
 fn pendingDrain(w: *JsonWriter) void {
+    pending_mutex.lock();
+    defer pending_mutex.unlock();
     while (pending_count > 0) {
         const slot = pending_head;
         const event_text = pending_events[slot][0..pending_event_lens[slot]];
@@ -141,10 +365,11 @@ fn pendingDrain(w: *JsonWriter) void {
 
 // ── SSE client tracking ────────────────────────────────────────────
 const MAX_SSE_CLIENTS = 8;
-var sse_clients: [MAX_SSE_CLIENTS]SOCKET = .{INVALID_SOCKET} ** MAX_SSE_CLIENTS;
+var sse_clients: [MAX_SSE_CLIENTS]SOCKET = @splat(INVALID_SOCKET);
 var sse_session_ids: [MAX_SSE_CLIENTS][32]u8 = undefined;
-var sse_session_lens: [MAX_SSE_CLIENTS]usize = .{0} ** MAX_SSE_CLIENTS;
+var sse_session_lens: [MAX_SSE_CLIENTS]usize = @splat(0);
 var sse_next_id: u32 = 1;
+var sse_send_mutex: CritLock = .{};
 
 fn sseAddClient(sock: SOCKET) ?usize {
     for (0..MAX_SSE_CLIENTS) |i| {
@@ -179,6 +404,8 @@ fn sseFindBySessionId(session_id: []const u8) ?usize {
 }
 
 fn sseSendEvent(sock: SOCKET, event: []const u8, data: []const u8) void {
+    sse_send_mutex.lock();
+    defer sse_send_mutex.unlock();
     wsSend(sock, "event: ");
     wsSend(sock, event);
     wsSend(sock, "\ndata: ");
@@ -263,6 +490,21 @@ pub fn start() void {
 
     server_running = true;
 
+    // Initialize synchronization primitives and start the single
+    // request-execution worker before accepting connections
+    job_lock.init();
+    pending_mutex.init();
+    sse_send_mutex.init();
+    job_event = CreateEventA(null, 0, 0, null);
+    worker_running = true;
+    worker_handle = CreateThread(null, 0, workerThreadProc, null, 0, null);
+    if (worker_handle == null or job_event == null) {
+        worker_running = false;
+        server_running = false;
+        bridge.logPuts("[x64dbg-MCP Server] Failed to create worker thread.\x00");
+        return;
+    }
+
     server_handle = CreateThread(null, 0, serverThreadProc, null, 0, null);
     if (server_handle == null) {
         server_running = false;
@@ -295,15 +537,32 @@ pub fn stop() void {
     // Close all SSE client sockets to unblock their keepalive loops
     for (&sse_clients) |*slot| {
         if (slot.* != INVALID_SOCKET) {
-            _ = ws2.closesocket(slot.*);
+            _ = closesocket(slot.*);
             slot.* = INVALID_SOCKET;
         }
     }
 
     // Close listen socket to unblock accept()
     if (listen_sock != INVALID_SOCKET) {
-        _ = ws2.closesocket(listen_sock);
+        _ = closesocket(listen_sock);
         listen_sock = INVALID_SOCKET;
+    }
+
+    // Stop the request worker: reject new jobs, drain the queue, then join
+    job_lock.lock();
+    worker_running = false;
+    job_lock.unlock();
+    if (job_event) |ev| {
+        _ = SetEvent(ev);
+    }
+    if (worker_handle) |h| {
+        _ = WaitForSingleObject(h, 10000);
+        _ = CloseHandle(h);
+        worker_handle = null;
+    }
+    if (job_event) |ev| {
+        _ = CloseHandle(ev);
+        job_event = null;
     }
 
     // Wait for server thread to exit (up to 5s)
@@ -335,49 +594,49 @@ fn serverThreadProc(_: ?*anyopaque) callconv(.winapi) u32 {
 }
 
 fn clientThreadProc(param: ?*anyopaque) callconv(.winapi) u32 {
-    const sock: SOCKET = @ptrCast(@alignCast(param));
+    const sock: SOCKET = @intFromPtr(param);
     handleClient(sock);
     return 0;
 }
 
 fn serverLoop() void {
-    var wsa_data: ws2.WSADATA = undefined;
-    if (ws2.WSAStartup(0x0202, &wsa_data) != 0) {
+    var wsa_data: [512]u8 align(8) = undefined; // WSADATA (real size ~408)
+    if (WSAStartup(0x0202, wsa_data[0..].ptr) != 0) {
         server_running = false;
         bridge.logPuts("[x64dbg-MCP Server] WSAStartup failed.\x00");
         return;
     }
 
-    const sock = ws2.socket(ws2.AF.INET, ws2.SOCK.STREAM, 0);
+    const sock = socket(ws2.AF.INET, ws2.SOCK.STREAM, 0);
     if (sock == INVALID_SOCKET) {
         server_running = false;
         bridge.logPuts("[x64dbg-MCP Server] socket() failed.\x00");
-        _ = ws2.WSACleanup();
+        _ = WSACleanup();
         return;
     }
     listen_sock = sock;
     defer {
-        _ = ws2.closesocket(sock);
+        _ = closesocket(sock);
         listen_sock = INVALID_SOCKET;
-        _ = ws2.WSACleanup();
+        _ = WSACleanup();
     }
 
     const one: i32 = 1;
-    _ = ws2.setsockopt(sock, ws2.SOL.SOCKET, ws2.SO.REUSEADDR, @ptrCast(&one), @sizeOf(i32));
+    _ = setsockopt(sock, ws2.SOL.SOCKET, ws2.SO.REUSEADDR, @ptrCast(&one), @sizeOf(i32));
 
     var addr: ws2.sockaddr.in = .{
         .family = ws2.AF.INET,
-        .port = ws2.htons(server_port),
+        .port = htons(server_port),
         .addr = parseIpAddr(server_ip[0..server_ip_len]),
     };
 
-    if (ws2.bind(sock, @ptrCast(&addr), @sizeOf(ws2.sockaddr.in)) != 0) {
+    if (bind(sock, &addr, @sizeOf(ws2.sockaddr.in)) != 0) {
         server_running = false;
         bridge.logPuts("[x64dbg-MCP Server] bind() failed.\x00");
         return;
     }
 
-    if (ws2.listen(sock, 10) != 0) {
+    if (listen(sock, 10) != 0) {
         server_running = false;
         bridge.logPuts("[x64dbg-MCP Server] listen() failed.\x00");
         return;
@@ -386,15 +645,15 @@ fn serverLoop() void {
     logListening();
 
     while (server_running) {
-        const client = ws2.accept(sock, null, null);
+        const client = accept(sock, null, null);
         if (client == INVALID_SOCKET) {
             if (!server_running) break;
             continue;
         }
 
-        const h = CreateThread(null, 0, clientThreadProc, @ptrCast(@alignCast(client)), 0, null);
+        const h = CreateThread(null, 0, clientThreadProc, @ptrFromInt(client), 0, null);
         if (h == null) {
-            _ = ws2.closesocket(client);
+            _ = closesocket(client);
         } else {
             _ = CloseHandle(h);
         }
@@ -409,7 +668,7 @@ fn wsSend(sock: SOCKET, data: []const u8) void {
     while (sent < data.len) {
         const remaining = data.len - sent;
         const chunk: i32 = @intCast(@min(remaining, 0x7FFFFFFF));
-        const n = ws2.send(sock, @ptrCast(data.ptr + sent), chunk, 0);
+        const n = send(sock, @ptrCast(data.ptr + sent), chunk, 0);
         if (n <= 0) return;
         sent += @intCast(n);
     }
@@ -422,7 +681,7 @@ fn wsRecv(sock: SOCKET) RecvResult {
 
     while (result.len < result.buf.len) {
         const max_len: i32 = @intCast(@min(result.buf.len - result.len, 0x7FFFFFFF));
-        const n = ws2.recv(sock, result.buf[result.len..].ptr, max_len, 0);
+        const n = recv(sock, result.buf[result.len..].ptr, max_len, 0);
         if (n <= 0) return result;
         result.len += @intCast(n);
 
@@ -437,7 +696,7 @@ fn wsRecv(sock: SOCKET) RecvResult {
 fn handleClient(sock: SOCKET) void {
     const recv_result = wsRecv(sock);
     if (recv_result.len == 0) {
-        _ = ws2.closesocket(sock);
+        _ = closesocket(sock);
         return;
     }
 
@@ -446,7 +705,7 @@ fn handleClient(sock: SOCKET) void {
 
     if (std.mem.startsWith(u8, method_line, "OPTIONS ")) {
         wsSend(sock, "HTTP/1.1 204 No Content\r\n" ++ CORS_HEADERS ++ "\r\n");
-        _ = ws2.closesocket(sock);
+        _ = closesocket(sock);
         return;
     }
 
@@ -464,7 +723,7 @@ fn handleClient(sock: SOCKET) void {
         }
         if (!authorized) {
             wsSend(sock, "HTTP/1.1 401 Unauthorized\r\n" ++ CORS_HEADERS ++ "Content-Length: 24\r\n\r\n{\"error\":\"Unauthorized\"}");
-            _ = ws2.closesocket(sock);
+            _ = closesocket(sock);
             return;
         }
     }
@@ -473,7 +732,7 @@ fn handleClient(sock: SOCKET) void {
         const path = getPath(method_line);
         if (std.mem.indexOf(u8, path, ".well-known") != null) {
             wsSend(sock, "HTTP/1.1 404 Not Found\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
-            _ = ws2.closesocket(sock);
+            _ = closesocket(sock);
             return;
         }
         if (std.mem.eql(u8, path, "/sse")) {
@@ -481,7 +740,7 @@ fn handleClient(sock: SOCKET) void {
             return;
         }
         sendServerInfo(sock);
-        _ = ws2.closesocket(sock);
+        _ = closesocket(sock);
         return;
     }
 
@@ -489,7 +748,7 @@ fn handleClient(sock: SOCKET) void {
         const path = getPath(method_line);
         if (std.mem.indexOf(u8, path, ".well-known") != null) {
             wsSend(sock, "HTTP/1.1 404 Not Found\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
-            _ = ws2.closesocket(sock);
+            _ = closesocket(sock);
             return;
         }
 
@@ -507,70 +766,35 @@ fn handleClient(sock: SOCKET) void {
         } else {
             wsSend(sock, "HTTP/1.1 400 Bad Request\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
         }
-        _ = ws2.closesocket(sock);
+        _ = closesocket(sock);
         return;
     }
 
     wsSend(sock, "HTTP/1.1 405 Method Not Allowed\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
-    _ = ws2.closesocket(sock);
+    _ = closesocket(sock);
 }
 
 fn handleJsonRpc(sock: SOCKET, body: []const u8) void {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch {
-        sendJsonRpcError(sock, null, -32700, "Parse error");
+    const job = submitRpc(body) orelse {
+        wsSend(sock, "HTTP/1.1 503 Service Unavailable\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
         return;
     };
-    defer parsed.deinit();
+    defer destroyJob(job);
 
-    const root = parsed.value;
-    const method_val = json_mod.getStringField(root, "method") orelse {
-        sendJsonRpcError(sock, null, -32600, "Invalid request: missing method");
-        return;
-    };
-    const id = json_mod.getObjectField(root, "id");
-
-    if (id == null or std.mem.startsWith(u8, method_val, "notifications/")) {
+    const resp = job.resp[0..job.resp_len];
+    if (resp.len == 0) {
+        // Notification — no response body
         wsSend(sock, "HTTP/1.1 202 Accepted\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
         return;
     }
-
-    if (std.mem.eql(u8, method_val, "initialize")) {
-        handleInitialize(sock, id);
-    } else if (std.mem.eql(u8, method_val, "tools/list")) {
-        handleToolsList(sock, id);
-    } else if (std.mem.eql(u8, method_val, "tools/call")) {
-        handleToolsCall(sock, id, root);
-    } else if (std.mem.eql(u8, method_val, "ping")) {
-        sendJsonRpcResult(sock, id, "{}");
-    } else {
-        sendJsonRpcError(sock, id, -32601, "Method not found");
-    }
+    sendRawJson(sock, resp);
 }
 
-fn handleInitialize(sock: SOCKET, id: ?std.json.Value) void {
-    var buf: [4096]u8 = undefined;
-    var w = JsonWriter.init(&buf);
-    buildInitializeResult(&w);
-    sendJsonRpcResult(sock, id, w.slice());
-}
-
-fn handleToolsList(sock: SOCKET, id: ?std.json.Value) void {
-    var buf: [65536]u8 = undefined;
-    var w = JsonWriter.init(&buf);
-    buildToolsListResult(&w);
-    sendJsonRpcResult(sock, id, w.slice());
-}
-
-fn handleToolsCall(sock: SOCKET, id: ?std.json.Value, root: std.json.Value) void {
-    var buf: [131072]u8 = undefined;
-    var w = JsonWriter.init(&buf);
-    buildToolsCallResult(&w, root);
-    const result_str = w.slice();
-    if (std.mem.startsWith(u8, result_str, "{\"error\":")) {
-        sendJsonRpcError(sock, id, -32602, result_str);
-    } else {
-        sendJsonRpcResult(sock, id, result_str);
-    }
+fn sendRawJson(sock: SOCKET, body_slice: []const u8) void {
+    var header_buf: [512]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body_slice.len}) catch return;
+    wsSend(sock, header);
+    wsSend(sock, body_slice);
 }
 
 // ── SSE transport ──────────────────────────────────────────────────
@@ -578,7 +802,7 @@ fn handleToolsCall(sock: SOCKET, id: ?std.json.Value, root: std.json.Value) void
 fn handleSseConnect(sock: SOCKET) void {
     const idx = sseAddClient(sock) orelse {
         wsSend(sock, "HTTP/1.1 503 Service Unavailable\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
-        _ = ws2.closesocket(sock);
+        _ = closesocket(sock);
         return;
     };
 
@@ -597,71 +821,37 @@ fn handleSseConnect(sock: SOCKET) void {
     while (server_running) {
         Sleep(5000);
         // Send keep-alive comment
-        const n = ws2.send(sock, ": keepalive\n\n", 13, 0);
+        const n = send(sock, ": keepalive\n\n", 13, 0);
         if (n <= 0) break;
     }
 
     sseRemoveClient(idx);
-    _ = ws2.closesocket(sock);
+    _ = closesocket(sock);
     bridge.logPuts("[x64dbg-MCP Server] SSE client disconnected.\x00");
 }
 
 fn handleSseMessage(sock: SOCKET, body: []const u8, session_id: ?[]const u8) void {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch {
-        sendJsonRpcError(sock, null, -32700, "Parse error");
+    const job = submitRpc(body) orelse {
+        wsSend(sock, "HTTP/1.1 503 Service Unavailable\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
         return;
     };
-    defer parsed.deinit();
+    defer destroyJob(job);
 
-    const root = parsed.value;
-    const method_val = json_mod.getStringField(root, "method") orelse {
-        sendJsonRpcError(sock, null, -32600, "Invalid request: missing method");
-        return;
-    };
-    const id = json_mod.getObjectField(root, "id");
-
-    // Notifications get 202
-    if (id == null or std.mem.startsWith(u8, method_val, "notifications/")) {
+    const resp_json = job.resp[0..job.resp_len];
+    if (resp_json.len == 0) {
+        // Notification — no response body
         wsSend(sock, "HTTP/1.1 202 Accepted\r\n" ++ CORS_HEADERS ++ "Content-Length: 0\r\n\r\n");
         return;
     }
 
-    // Process the RPC call and build the result
-    var result_buf: [131072]u8 = undefined;
-    var rw = JsonWriter.init(&result_buf);
-
-    if (std.mem.eql(u8, method_val, "initialize")) {
-        buildInitializeResult(&rw);
-    } else if (std.mem.eql(u8, method_val, "tools/list")) {
-        buildToolsListResult(&rw);
-    } else if (std.mem.eql(u8, method_val, "tools/call")) {
-        buildToolsCallResult(&rw, root);
-    } else if (std.mem.eql(u8, method_val, "ping")) {
-        rw.raw("{}");
-    } else {
-        // Method not found — respond directly on POST socket
-        sendJsonRpcError(sock, id, -32601, "Method not found");
-        return;
-    }
-
-    // Build full JSON-RPC response
-    var resp_buf: [131072]u8 = undefined;
-    var w = JsonWriter.init(&resp_buf);
-    w.raw("{\"jsonrpc\":\"2.0\",\"id\":");
-    writeJsonValue(&w, id);
-    w.raw(",\"result\":");
-    w.raw(rw.slice());
-    w.raw("}");
-    const resp_json = w.slice();
-
-    // Try to push response via SSE channel
+    // Push response via SSE channel when available
     const sse_idx = if (session_id) |sid| sseFindBySessionId(sid) else null;
     if (sse_idx) |idx| {
         sseSendEvent(sse_clients[idx], "message", resp_json);
+        wsSend(sock, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: 0\r\n\r\n");
+    } else {
+        sendRawJson(sock, resp_json);
     }
-
-    // Also respond on the POST connection
-    wsSend(sock, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: 0\r\n\r\n");
 }
 
 fn buildInitializeResult(w: *JsonWriter) void {
@@ -798,9 +988,11 @@ fn buildStateSnippet(buf: *[256]u8) []const u8 {
     const has_mod = bridge.getModuleAt(cip, &mod_buf);
     const mod_name = if (has_mod) bridge.cstrSlice(&mod_buf) else "unknown";
 
-    var dis_buf: [256]u8 = undefined;
-    const has_dis = if (bridge.GuiGetDisassembly) |f| f(cip, &dis_buf) != 0 else false;
-    const dis_text = if (has_dis) bridge.cstrSlice(&dis_buf) else "";
+    // Engine-side disassembly (GUI functions like GuiGetDisassembly are only
+    // safe on the GUI thread and crash when called from worker threads).
+    var instr: bridge.BASIC_INSTRUCTION_INFO = undefined;
+    const has_dis = if (bridge.DbgDisasmFastAt) |f| f(cip, &instr) != 0 else false;
+    const dis_text = if (has_dis) bridge.cstrSlice(&instr.instruction) else "";
 
     return std.fmt.bufPrint(buf, "[state] PAUSED at 0x{X} ({s}) | {s}", .{ cip, mod_name, dis_text }) catch buf[0..0];
 }
@@ -850,42 +1042,6 @@ fn sendServerInfo(sock: SOCKET) void {
     var buf: [512]u8 = undefined;
     const resp = std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch return;
     wsSend(sock, resp);
-}
-
-fn sendJsonRpcResult(sock: SOCKET, id: ?std.json.Value, result_json: []const u8) void {
-    var body_buf: [131072]u8 = undefined;
-    var w = JsonWriter.init(&body_buf);
-    w.raw("{\"jsonrpc\":\"2.0\",\"id\":");
-    writeJsonValue(&w, id);
-    w.raw(",\"result\":");
-    w.raw(result_json);
-    w.raw("}");
-
-    const body_slice = w.slice();
-    var header_buf: [512]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body_slice.len}) catch return;
-
-    wsSend(sock, header);
-    wsSend(sock, body_slice);
-}
-
-fn sendJsonRpcError(sock: SOCKET, id: ?std.json.Value, code: i32, message: []const u8) void {
-    var body_buf: [4096]u8 = undefined;
-    var w = JsonWriter.init(&body_buf);
-    w.raw("{\"jsonrpc\":\"2.0\",\"id\":");
-    writeJsonValue(&w, id);
-    w.raw(",\"error\":{\"code\":");
-    w.writeInt(code);
-    w.raw(",\"message\":");
-    w.writeString(message);
-    w.raw("}}");
-
-    const body_slice = w.slice();
-    var header_buf: [512]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "HTTP/1.1 200 OK\r\n" ++ CORS_HEADERS ++ "Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body_slice.len}) catch return;
-
-    wsSend(sock, header);
-    wsSend(sock, body_slice);
 }
 
 fn writeJsonValue(w: *JsonWriter, val: ?std.json.Value) void {

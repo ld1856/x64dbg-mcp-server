@@ -902,6 +902,22 @@ fn errResult(out: []u8, text: []const u8) ToolResult {
     return .{ .text = out[0..len], .is_error = true };
 }
 
+// Disassembly text WITHOUT touching the GUI. GuiGetDisassembly runs Qt GUI
+// code and must never be called from MCP worker threads: doing so corrupts
+// x64gui's heap (observed crash: 0xC0000374 double-free inside x64gui via
+// x64bridge!GuiGetDisassembly). DbgDisasmFastAt lives in the DBG module and
+// performs a pure disassembly read, which is safe here.
+fn disasmText(addr: bridge.duint, buf: *[256]u8) []const u8 {
+    buf.* = std.mem.zeroes([256]u8);
+    const f = bridge.DbgDisasmFastAt orelse return "";
+    var info: bridge.BASIC_INSTRUCTION_INFO = std.mem.zeroes(bridge.BASIC_INSTRUCTION_INFO);
+    if (f(addr, &info) == 0) return "";
+    const text = std.mem.sliceTo(info.instruction[0..], 0);
+    const n = @min(text.len, buf.len - 1);
+    @memcpy(buf[0..n], text[0..n]);
+    return buf[0..n];
+}
+
 fn fmtResult(out: []u8, comptime fmt: []const u8, args: anytype) ToolResult {
     const s = std.fmt.bufPrint(out, fmt, args) catch return result(out[0..0], "");
     return .{ .text = s };
@@ -1358,27 +1374,22 @@ fn appendStepContext(out: []u8, pos: *usize) void {
         pos.* += lbl_line.len;
     }
 
-    const gui_fn = bridge.GuiGetDisassembly orelse return;
-    var text_buf: [256]u8 = std.mem.zeroes([256]u8);
-    if (gui_fn(cip, &text_buf) != 0) {
-        const instr = bridge.cstrSlice(&text_buf);
-        if (instr.len > 0) {
-            const dis_line = std.fmt.bufPrint(out[pos.*..], "\nInstruction: {s}", .{instr}) catch return;
-            pos.* += dis_line.len;
-        }
+    var text_buf: [256]u8 = undefined;
+    const instr = disasmText(cip, &text_buf);
+    if (instr.len > 0) {
+        const dis_line = std.fmt.bufPrint(out[pos.*..], "\nInstruction: {s}", .{instr}) catch return;
+        pos.* += dis_line.len;
     }
 
     var next_buf: [64]u8 = undefined;
     const next_expr = std.fmt.bufPrint(&next_buf, "dis.next(0x{X})\x00", .{cip}) catch return;
     const next_addr = bridge.valFromString(@ptrCast(next_expr.ptr));
     if (next_addr != 0 and next_addr != cip) {
-        var text_buf2: [256]u8 = std.mem.zeroes([256]u8);
-        if (gui_fn(next_addr, &text_buf2) != 0) {
-            const next_instr = bridge.cstrSlice(&text_buf2);
-            if (next_instr.len > 0) {
-                const next_line = std.fmt.bufPrint(out[pos.*..], "\nNext: 0x{X}  {s}", .{ next_addr, next_instr }) catch return;
-                pos.* += next_line.len;
-            }
+        var text_buf2: [256]u8 = undefined;
+        const next_instr = disasmText(next_addr, &text_buf2);
+        if (next_instr.len > 0) {
+            const next_line = std.fmt.bufPrint(out[pos.*..], "\nNext: 0x{X}  {s}", .{ next_addr, next_instr }) catch return;
+            pos.* += next_line.len;
         }
     }
 }
@@ -1680,7 +1691,6 @@ fn disassemble(params: ?std.json.Value, out: []u8) ToolResult {
     if (addr == 0 and !std.mem.eql(u8, addr_str, "0"))
         return fmtErr(out, "Error: Could not resolve '{s}'.", .{addr_str});
 
-    const gui_fn = bridge.GuiGetDisassembly;
     var pos: usize = 0;
     var i: usize = 0;
     while (i < count) : (i += 1) {
@@ -1702,13 +1712,8 @@ fn disassemble(params: ?std.json.Value, out: []u8) ToolResult {
             }
         }
 
-        var text_buf: [256]u8 = std.mem.zeroes([256]u8);
-        var instr_text: []const u8 = "";
-        if (gui_fn) |f| {
-            if (f(addr, &text_buf) != 0) {
-                instr_text = bridge.cstrSlice(&text_buf);
-            }
-        }
+        var text_buf: [256]u8 = undefined;
+        const instr_text = disasmText(addr, &text_buf);
 
         if (instr_text.len > 0) {
             const line = std.fmt.bufPrint(out[pos..], "0x{X}: {s}| {s}\n", .{ addr, hex_buf[0..bpos], instr_text }) catch break;
@@ -2580,17 +2585,12 @@ fn traceInto(params: ?std.json.Value, out: []u8) ToolResult {
         count = @intCast(@min(@max(c, 1), 100));
     }
 
-    const gui_fn = bridge.GuiGetDisassembly;
     var pos: usize = 0;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const cip = bridge.valFromString("cip\x00");
-        var text_buf: [256]u8 = std.mem.zeroes([256]u8);
-        var instr: []const u8 = "";
-        if (gui_fn) |gd| {
-            if ((@as(u32, @bitCast(gd(cip, &text_buf))) & 0xFF) != 0)
-                instr = bridge.cstrSlice(&text_buf);
-        }
+        var text_buf: [256]u8 = undefined;
+        const instr = disasmText(cip, &text_buf);
         const line = std.fmt.bufPrint(out[pos..], "0x{X}: {s}\n", .{ cip, instr }) catch break;
         pos += line.len;
         _ = bridge.cmdExec("sti\x00");
@@ -3036,7 +3036,6 @@ fn disassembleFunction(params: ?std.json.Value, out: []u8) ToolResult {
         pos += hdr.len;
     }
 
-    const gui_fn = bridge.GuiGetDisassembly;
     var current = func_start;
     var count: usize = 0;
     while (current <= func_end and count < 500) : (count += 1) {
@@ -3045,13 +3044,8 @@ fn disassembleFunction(params: ?std.json.Value, out: []u8) ToolResult {
         const next_addr = bridge.valFromString(@ptrCast(next_expr.ptr));
         if (next_addr == 0 or next_addr == current) break;
 
-        var text_buf: [256]u8 = std.mem.zeroes([256]u8);
-        var instr_text: []const u8 = "";
-        if (gui_fn) |f| {
-            if (f(current, &text_buf) != 0) {
-                instr_text = bridge.cstrSlice(&text_buf);
-            }
-        }
+        var text_buf: [256]u8 = undefined;
+        const instr_text = disasmText(current, &text_buf);
 
         if (instr_text.len > 0) {
             const line = std.fmt.bufPrint(out[pos..], "0x{X}  {s}\n", .{ current, instr_text }) catch break;
@@ -3616,8 +3610,8 @@ fn traceOver(params: ?std.json.Value, out: []u8) ToolResult {
 
         const cip = bridge.valFromString("cip");
         var dis_buf: [256]u8 = undefined;
-        const has_dis = if (bridge.GuiGetDisassembly) |f| f(cip, &dis_buf) != 0 else false;
-        const dis_text = if (has_dis) bridge.cstrSlice(&dis_buf) else "???";
+        const d = disasmText(cip, &dis_buf);
+        const dis_text = if (d.len > 0) d else "???";
         const line = std.fmt.bufPrint(out[pos..], "0x{X}: {s}\n", .{ cip, dis_text }) catch break;
         pos += line.len;
     }
