@@ -224,7 +224,7 @@ Changes take effect immediately — the server auto-restarts on save. Config is 
 
 ## Building
 
-Requires [Zig 0.16-dev](https://ziglang.org/download/) or later. Builds on Windows, WSL, Linux, or macOS.
+Requires [Zig 0.17](https://ziglang.org/download/) or later. The codebase uses Zig 0.17 APIs (e.g. `std.Io.Writer`, direct `ws2_32` extern bindings since Zig 0.17 no longer exports them), so older Zig versions will not compile it. Builds on Windows, WSL, Linux, or macOS.
 
 ```console
 zig build -Doptimize=ReleaseSafe --prefix dist
