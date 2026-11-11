@@ -40,6 +40,7 @@ Built with [Zig](https://ziglang.org/) — zero dependencies, single-binary outp
 - **Zero Dependencies:** Pure native plugin, no runtime or framework needed.
 - **x32 and x64:** Single codebase, builds both architectures from one command.
 - **Dual Transport:** Streamable HTTP + SSE — compatible with any MCP client (new and legacy).
+- **Thread-Safe:** Every request is queued and executed sequentially on a single worker thread — x64dbg's engine and GUI APIs are not thread-safe, and concurrent calls corrupt the debugger heap.
 - **Bearer Auth:** Mandatory token authentication — auto-generated on first run, required on every request to prevent unauthorized access.
 - **Config Dialog:** Change IP/port/token from the Plugins menu, auto-restarts the server on save.
 - **Auto-Start:** MCP server starts automatically when x64dbg launches.
@@ -251,7 +252,7 @@ dist/
     ├── core/
     │   ├── bridge.zig            # x64dbg SDK bindings (runtime-resolved)
     │   ├── config.zig            # Win32 config dialog and persistence
-    │   └── mcp_server.zig        # HTTP server and JSON-RPC dispatch
+    │   └── mcp_server.zig        # HTTP server, JSON-RPC dispatch, request queue + worker thread
     ├── mcp/
     │   ├── json.zig              # JSON writer and parser helpers
     │   └── tools.zig             # MCP tool definitions and handlers
@@ -263,6 +264,8 @@ dist/
 ## How It Works
 
 The plugin loads into x64dbg at startup, resolves the debugger's API symbols at runtime from `x64bridge.dll` and `x64dbg.dll`, then spins up an HTTP server on a background thread. MCP clients connect over HTTP and send JSON-RPC requests to invoke tools — each tool maps directly to x64dbg SDK calls (breakpoints, memory reads, command execution, etc.).
+
+x64dbg's engine and GUI APIs are **not thread-safe**, so all requests are funneled through a FIFO queue into a single dedicated worker thread that executes them one at a time. Connection threads only perform socket I/O: they enqueue the raw JSON-RPC body, wait on a completion event, then send back the response. Requests that arrive while the queue is full (or while the server is stopping) receive HTTP 503.
 
 No polling, no external processes — the plugin lives inside x64dbg's address space with direct access to the debugger API.
 
